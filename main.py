@@ -44,14 +44,11 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional
 
-from src.config import get_config, Config
-from src.feishu_doc import FeishuDocManager
-from src.logging_config import setup_logging
-from src.notification import NotificationService
 from src.core.pipeline import StockAnalysisPipeline
 from src.core.market_review import run_market_review
-from src.search_service import SearchService
-from src.analyzer import GeminiAnalyzer
+
+from src.config import get_config, Config
+from src.logging_config import setup_logging
 
 
 logger = logging.getLogger(__name__)
@@ -119,6 +116,12 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--no-run-immediately',
+        action='store_true',
+        help='定时任务启动时不立即执行一次'
+    )
+
+    parser.add_argument(
         '--market-review',
         action='store_true',
         help='仅运行大盘复盘分析'
@@ -174,6 +177,33 @@ def parse_arguments() -> argparse.Namespace:
         help='不保存分析上下文快照'
     )
 
+    # === Backtest ===
+    parser.add_argument(
+        '--backtest',
+        action='store_true',
+        help='运行回测（对历史分析结果进行评估）'
+    )
+
+    parser.add_argument(
+        '--backtest-code',
+        type=str,
+        default=None,
+        help='仅回测指定股票代码'
+    )
+
+    parser.add_argument(
+        '--backtest-days',
+        type=int,
+        default=None,
+        help='回测评估窗口（交易日数，默认使用配置）'
+    )
+
+    parser.add_argument(
+        '--backtest-force',
+        action='store_true',
+        help='强制回测（即使已有回测结果也重新计算）'
+    )
+
     return parser.parse_args()
 
 
@@ -192,6 +222,14 @@ def run_full_analysis(
         if getattr(args, 'single_notify', False):
             config.single_stock_notify = True
 
+        # Issue #190: 个股与大盘复盘合并推送
+        merge_notification = (
+            getattr(config, 'merge_email_notification', False)
+            and config.market_review_enabled
+            and not getattr(args, 'no_market_review', False)
+            and not config.single_stock_notify
+        )
+
         # 创建调度器
         save_context_snapshot = None
         if getattr(args, 'no_context_snapshot', False):
@@ -209,7 +247,8 @@ def run_full_analysis(
         results = pipeline.run(
             stock_codes=stock_codes,
             dry_run=args.dry_run,
-            send_notification=not args.no_notify
+            send_notification=not args.no_notify,
+            merge_notification=merge_notification
         )
 
         # Issue #128: 分析间隔 - 在个股分析和大盘分析之间添加延迟
@@ -226,11 +265,28 @@ def run_full_analysis(
                 notifier=pipeline.notifier,
                 analyzer=pipeline.analyzer,
                 search_service=pipeline.search_service,
-                send_notification=not args.no_notify
+                send_notification=not args.no_notify,
+                merge_notification=merge_notification
             )
             # 如果有结果，赋值给 market_report 用于后续飞书文档生成
             if review_result:
                 market_report = review_result
+
+        # Issue #190: 合并推送（个股+大盘复盘）
+        if merge_notification and (results or market_report) and not args.no_notify:
+            parts = []
+            if market_report:
+                parts.append(f"# 📈 大盘复盘\n\n{market_report}")
+            if results:
+                dashboard_content = pipeline.notifier.generate_dashboard_report(results)
+                parts.append(f"# 🚀 个股决策仪表盘\n\n{dashboard_content}")
+            if parts:
+                combined_content = "\n\n---\n\n".join(parts)
+                if pipeline.notifier.is_available():
+                    if pipeline.notifier.send(combined_content, email_send_to_all=True):
+                        logger.info("已合并推送（个股+大盘复盘）")
+                    else:
+                        logger.warning("合并推送失败")
 
         # 输出摘要
         if results:
@@ -246,6 +302,8 @@ def run_full_analysis(
 
         # === 新增：生成飞书云文档 ===
         try:
+            from src.feishu_doc import FeishuDocManager
+
             feishu_doc = FeishuDocManager()
             if feishu_doc.is_configured() and (results or market_report):
                 logger.info("正在创建飞书云文档...")
@@ -278,6 +336,26 @@ def run_full_analysis(
         except Exception as e:
             logger.error(f"飞书文档生成失败: {e}")
 
+        # === Auto backtest ===
+        try:
+            if getattr(config, 'backtest_enabled', False):
+                from src.services.backtest_service import BacktestService
+
+                logger.info("开始自动回测...")
+                service = BacktestService()
+                stats = service.run_backtest(
+                    force=False,
+                    eval_window_days=getattr(config, 'backtest_eval_window_days', 10),
+                    min_age_days=getattr(config, 'backtest_min_age_days', 14),
+                    limit=200,
+                )
+                logger.info(
+                    f"自动回测完成: processed={stats.get('processed')} saved={stats.get('saved')} "
+                    f"completed={stats.get('completed')} insufficient={stats.get('insufficient')} errors={stats.get('errors')}"
+                )
+        except Exception as e:
+            logger.warning(f"自动回测失败（已忽略）: {e}")
+
     except Exception as e:
         logger.exception(f"分析流程执行失败: {e}")
 
@@ -293,7 +371,7 @@ def start_api_server(host: str, port: int, config: Config) -> None:
     """
     import threading
     import uvicorn
-    
+
     def run_server():
         level_name = (config.log_level or "INFO").lower()
         uvicorn.run(
@@ -303,7 +381,7 @@ def start_api_server(host: str, port: int, config: Config) -> None:
             log_level=level_name,
             log_config=None,
         )
-    
+
     thread = threading.Thread(target=run_server, daemon=True)
     thread.start()
     logger.info(f"FastAPI 服务已启动: http://{host}:{port}")
@@ -357,23 +435,23 @@ def main() -> int:
 
     # 配置日志（输出到控制台和文件）
     setup_logging(log_prefix="stock_analysis", debug=args.debug, log_dir=config.log_dir)
-    
+
     logger.info("=" * 60)
     logger.info("A股自选股智能分析系统 启动")
     logger.info(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
-    
+
     # 验证配置
     warnings = config.validate()
     for warning in warnings:
         logger.warning(warning)
-    
+
     # 解析股票列表
     stock_codes = None
     if args.stocks:
         stock_codes = [code.strip() for code in args.stocks.split(',') if code.strip()]
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
-    
+
     # === 处理 --webui / --webui-only 参数，映射到 --serve / --serve-only ===
     if args.webui:
         args.serve = True
@@ -393,7 +471,7 @@ def main() -> int:
             args.host = os.getenv('WEBUI_HOST')
         if args.port == 8000 and os.getenv('WEBUI_PORT'):
             args.port = int(os.getenv('WEBUI_PORT'))
-    
+
     bot_clients_started = False
     if start_serve:
         try:
@@ -401,10 +479,10 @@ def main() -> int:
             bot_clients_started = True
         except Exception as e:
             logger.error(f"启动 FastAPI 服务失败: {e}")
-    
+
     if bot_clients_started:
         start_bot_stream_clients(config)
-    
+
     # === 仅 Web 服务模式：不自动执行分析 ===
     if args.serve_only:
         logger.info("模式: 仅 Web 服务")
@@ -420,23 +498,46 @@ def main() -> int:
         return 0
 
     try:
+        # 模式0: 回测
+        if getattr(args, 'backtest', False):
+            logger.info("模式: 回测")
+            from src.services.backtest_service import BacktestService
+
+            service = BacktestService()
+            stats = service.run_backtest(
+                code=getattr(args, 'backtest_code', None),
+                force=getattr(args, 'backtest_force', False),
+                eval_window_days=getattr(args, 'backtest_days', None),
+            )
+            logger.info(
+                f"回测完成: processed={stats.get('processed')} saved={stats.get('saved')} "
+                f"completed={stats.get('completed')} insufficient={stats.get('insufficient')} errors={stats.get('errors')}"
+            )
+            return 0
+
         # 模式1: 仅大盘复盘
         if args.market_review:
+            from src.analyzer import GeminiAnalyzer
+            from src.core.market_review import run_market_review
+            from src.notification import NotificationService
+            from src.search_service import SearchService
+
             logger.info("模式: 仅大盘复盘")
             notifier = NotificationService()
-            
+
             # 初始化搜索服务和分析器（如果有配置）
             search_service = None
             analyzer = None
-            
+
             if config.bocha_api_keys or config.tavily_api_keys or config.brave_api_keys or config.serpapi_keys:
                 search_service = SearchService(
                     bocha_keys=config.bocha_api_keys,
                     tavily_keys=config.tavily_api_keys,
                     brave_keys=config.brave_api_keys,
-                    serpapi_keys=config.serpapi_keys
+                    serpapi_keys=config.serpapi_keys,
+                    news_max_age_days=config.news_max_age_days,
                 )
-            
+
             if config.gemini_api_key or config.openai_api_key:
                 analyzer = GeminiAnalyzer(api_key=config.gemini_api_key)
                 if not analyzer.is_available():
@@ -444,37 +545,46 @@ def main() -> int:
                     analyzer = None
             else:
                 logger.warning("未检测到 API Key (Gemini/OpenAI)，将仅使用模板生成报告")
-            
+
             run_market_review(
-                notifier=notifier, 
-                analyzer=analyzer, 
+                notifier=notifier,
+                analyzer=analyzer,
                 search_service=search_service,
                 send_notification=not args.no_notify
             )
             return 0
-        
+
         # 模式2: 定时任务模式
         if args.schedule or config.schedule_enabled:
             logger.info("模式: 定时任务")
             logger.info(f"每日执行时间: {config.schedule_time}")
+
+            # Determine whether to run immediately:
+            # Command line arg --no-run-immediately overrides config if present.
+            # Otherwise use config (defaults to True).
+            should_run_immediately = config.schedule_run_immediately
+            if getattr(args, 'no_run_immediately', False):
+                should_run_immediately = False
             
+            logger.info(f"启动时立即执行: {should_run_immediately}")
+
             from src.scheduler import run_with_schedule
-            
+
             def scheduled_task():
                 run_full_analysis(config, args, stock_codes)
-            
+
             run_with_schedule(
                 task=scheduled_task,
                 schedule_time=config.schedule_time,
-                run_immediately=True  # 启动时先执行一次
+                run_immediately=should_run_immediately
             )
             return 0
-        
+
         # 模式3: 正常单次运行
         run_full_analysis(config, args, stock_codes)
-        
+
         logger.info("\n程序执行完成")
-        
+
         # 如果启用了服务且是非定时任务模式，保持程序运行
         keep_running = start_serve and not (args.schedule or config.schedule_enabled)
         if keep_running:
@@ -484,13 +594,13 @@ def main() -> int:
                     time.sleep(1)
             except KeyboardInterrupt:
                 pass
-        
+
         return 0
-        
+
     except KeyboardInterrupt:
         logger.info("\n用户中断，程序退出")
         return 130
-        
+
     except Exception as e:
         logger.exception(f"程序执行失败: {e}")
         return 1
